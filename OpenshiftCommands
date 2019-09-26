@@ -1,0 +1,143 @@
+
+apiVersion: v1
+kind: Namespace
+metadata:
+   annotations:
+      openshift.io/node-selector: region=infra
+
+
+
+Adding HA Router
+
+https://docs.openshift.org/latest/admin_guide/high_availability.html
+1. oc label nodes ose-infra{1,2}.spd-marriott.com "ha-router=vbox-ha-router"
+		oc label node 192.168.137.121 "ha-router=vbox-ha-router"
+2. for node in ose-infra{1,2}.spd-marriott.com; do   ssh $node <<EOF
+
+
+echo "Check multicast enabled ... ";
+ifconfig enp0s3 | grep -i MULTICAST
+
+echo "Check multicast groups ... "
+netstat -g -n | grep 224.0.0 | grep enp0s3
+
+echo "Optionally, add accept rule and persist it ... "
+/sbin/iptables -I INPUT -i enp0s3 -d 224.0.0.18/32 -j ACCEPT
+iptables-save
+
+echo "Please ensure the above rule is added on system restarts."
+
+EOF
+done;
+3. echo '
+{ "kind": "ServiceAccount",
+"apiVersion": "v1",
+"metadata": { "name": "ipfailover" }
+}
+' | oc create -f -
+4. oc edit scc privileged
+
+(add this to the bottom)
+
+- system:serviceaccount:default:ipfailover
+4. oadm ipfailover vbox-ha-router --replicas=2
+5. (change to your ose-vip)
+
+oadm ipfailover conf-ha-router --replicas=2   --selector="ha-router=vbox-ha-router" --virtual-ips="192.168.137.143"   --credentials=/etc/origin/master/openshift-router.kubeconfig    --service-account=ipfailover --create
+6. vi /etc/origin/master/master-config.yaml
+
+(modify all these, except the corsAllowedOrigins)
+
+     masterPublicURL: https://ose-vip.spd-marriott.com:8443
+     publicURL: https://ose-vip.spd-marriott.com:8443/console/
+     corsAllowedOrigins: ose-vip.spd-marriott.com
+     oauthConfig:
+ assetPublicURL: https://ose-vip.spd-marriott.com:8443/console/
+   masterPublicURL: https://ose-vip.spd-marriott.com:8443
+   masterURL: https://ose-vip.spd-marriott.com:8443
+7. systemctl restart atomic*
+8. oadm registry --config=/etc/origin/master/admin.kubeconfig \
+   --service-account=/etc/origin/master/openshift-registry.kubeconfig \
+   --images='registry.access.redhat.com/openshift3/ose-${component}:${version}'
+Andrew • Fri, 1:08 PM
+Andrew Shih
+Readd your Origin docker registry
+
+   oadm registry --config=admin.kubeconfig  --service-account=openshift-registry.kubeconfig
+Andrew • Fri, 1:25 PM
+Andrew Shih
+Adding Logging
+1. oadm new-project logging --node-selector="zone=green"
+2. oc project logging
+3. oc secrets new logging-deployer nothing=/dev/null
+4. oc create -f - <<API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+ name: logging-deployer
+secrets:
+- name: logging-deployer
+API
+5. oc policy add-role-to-user edit --serviceaccount logging-deployer
+6. oadm policy add-scc-to-user  \
+privileged system:serviceaccount:logging:aggregated-logging-fluentd
+7. oadm policy add-cluster-role-to-user cluster-reader \
+system:serviceaccount:logging:aggregated-logging-fluentd
+8. oc process logging-deployer-template -n logging \
+-v KIBANA_HOSTNAME=logging.ose-vip.spd-marriott.com,ES_CLUSTER_SIZE=1,PUBLIC_MASTER_URL=https://ose-vip.spd-marriott.com:8443 \
+| oc create -f -
+9. (wait a few seconds before running this, there should be output)
+oc get dc --selector logging-infra=elasticsearch
+10. oc process logging-support-template | oc create -f -
+11. openshift admin policy add-cluster-role-to-user cluster-reader system:serviceaccount:logging:aggregated-logging-fluentd
+12. oc get dc --selector logging-infra=elasticsearch
+====dc/logging-fluentd is not found====
+13. oc scale dc/logging-fluentd --replicas=2
+14. oc scale rc/logging-fluentd-1 --replicas=2
+15. oc scale dc/logging-kibana --replicas=2
+16. oc scale rc/logging-kibana-1 --replicas=2
+17. systemctl restart atomic-openshift-master-api
+(run on all 3 masters)
+Andrew • Fri, 1:56 PM
+Andrew Shih
+Adding  Metrics
+1. oc project openshift-infra
+ 2. (make sure there is a SPACE under metadata, before name)
+
+oc create -f - <<API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+name: metrics-deployer
+secrets:
+- name: metrics-deployer
+API
+3. oadm policy add-role-to-user \
+edit system:serviceaccount:openshift-infra:metrics-deployer
+4. oadm policy add-cluster-role-to-user \
+cluster-reader system:serviceaccount:openshift-infra:heapster
+5. oc secrets new metrics-deployer nothing=/dev/null
+6. cd $HOME
+7. cp /usr/share/openshift/examples/infrastructure-templates/enterprise/metrics-deployer.yaml .
+8. oc process -f metrics-deployer.yaml -v \
+HAWKULAR_METRICS_HOSTNAME=metrics.ose-vip.spd-marriott.com,USE_PERSISTENT_STORAGE=false \
+| oc create -f -
+9. leave OpenShift running for a while to load
+10. add entry for loggingPublicURL and metricsPublicURL to master-config.yml:
+
+[root@ose-master1 ~]# cat /etc/origin/master/master-config.yaml
+apiLevels:
+- v1
+apiVersion: v1
+assetConfig:
+ logoutURL: ""
+ masterPublicURL: https://ose-vip.spd-marriott.com:8443
+ publicURL: https://ose-vip.spd-marriott.com:8443/console/
+ loggingPublicURL: https://logging.ose-vip.spd-marriott.com
+ metricsPublicURL: https://metrics.ose-vip.spd-marriott.com/hawkular/metrics
+11. restart ose and refresh browser
+Andrew • Fri, 11:47 PM
+oc process -f metrics-deployer.yaml -v \
+    HAWKULAR_METRICS_HOSTNAME=hawkular-metrics.spd-marriott.com,USE_PERSISTENT_STORAGE=false \
+    | oc create -f -
+	
